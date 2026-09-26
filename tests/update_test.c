@@ -29,9 +29,9 @@ static eota_policy_t policy = {
     .trusted_time = true,
 };
 
-static const esp_partition_t old_slot = {.type = ESP_PARTITION_TYPE_APP, .subtype = ESP_PARTITION_SUBTYPE_APP_OTA_0, .address = 0x20000, .size = 0x1e0000};
-static const esp_partition_t new_slot = {.type = ESP_PARTITION_TYPE_APP, .subtype = ESP_PARTITION_SUBTYPE_APP_OTA_1, .address = 0x200000, .size = 0x1e0000};
-static const esp_partition_t wrong_slot = {.type = ESP_PARTITION_TYPE_APP, .subtype = ESP_PARTITION_SUBTYPE_APP_OTA_1, .address = 0x210000, .size = 0x1e0000};
+static const esp_partition_t old_slot = {.type = ESP_PARTITION_TYPE_APP, .subtype = ESP_PARTITION_SUBTYPE_APP_OTA_0, .address = 0x20000, .size = 0x1e0000, .erase_size = 4096};
+static const esp_partition_t new_slot = {.type = ESP_PARTITION_TYPE_APP, .subtype = ESP_PARTITION_SUBTYPE_APP_OTA_1, .address = 0x200000, .size = 0x1e0000, .erase_size = 4096};
+static const esp_partition_t wrong_slot = {.type = ESP_PARTITION_TYPE_APP, .subtype = ESP_PARTITION_SUBTYPE_APP_OTA_1, .address = 0x210000, .size = 0x1e0000, .erase_size = 4096};
 static const esp_partition_t *boot, *selected_slot;
 static uint8_t image_bytes[IMAGE_BYTES], staged_bytes[IMAGE_BYTES];
 static bool valid_old, complete, rollback_possible, bad_chip, fail_restore, fail_read, fail_select;
@@ -43,12 +43,15 @@ static bool stall_headers, stall_first_byte, stall_midbody, early_fin, fin_midbo
 static bool select_then_fail_without_switch;
 static bool slow_drip_headers, slow_drip_body;
 static bool missing_image_partition;
+static bool target_image_valid, fail_erase, reverse_slots;
+static const esp_partition_t *last_erased;
 static esp_err_t image_verify_result;
 static uint32_t verified_image_size_bytes;
 static int image_verify_calls;
 static int status_code, init_calls, open_calls, header_calls, read_calls, cleanup_calls;
 static int transport_create_calls, transport_destroy_calls;
 static int begin_calls, write_calls, end_calls, abort_calls, select_calls, restore_calls, mark_calls, invalidate_calls, partition_reads;
+static int erase_calls;
 static int64_t content_length, now_us, read_advance_us;
 static int64_t begin_advance_us, write_advance_us, flash_read_advance_us;
 static int64_t end_advance_us, cleanup_advance_us, preflight_advance_us, verify_advance_us;
@@ -81,6 +84,10 @@ static void reset(void)
     select_then_fail_without_switch = false;
     slow_drip_headers = slow_drip_body = false;
     missing_image_partition = false;
+    target_image_valid = true;
+    fail_erase = false;
+    reverse_slots = false;
+    last_erased = NULL;
     image_verify_result = ESP_OK;
     verified_image_size_bytes = IMAGE_BYTES;
     image_verify_calls = 0;
@@ -90,6 +97,7 @@ static void reset(void)
     init_calls = open_calls = header_calls = read_calls = cleanup_calls = 0;
     transport_create_calls = transport_destroy_calls = 0;
     begin_calls = write_calls = end_calls = abort_calls = select_calls = restore_calls = mark_calls = invalidate_calls = partition_reads = 0;
+    erase_calls = 0;
     now_us = read_advance_us = 0;
     begin_advance_us = write_advance_us = flash_read_advance_us = 0;
     end_advance_us = cleanup_advance_us = preflight_advance_us = verify_advance_us = 0;
@@ -114,7 +122,8 @@ static void digest(eota_image_t *request)
 
 int64_t esp_timer_get_time(void) { return now_us; }
 int esp_crt_bundle_attach(void *config) { (void)config; return 0; }
-const esp_partition_t *esp_ota_get_running_partition(void) { return &old_slot; }
+const esp_partition_t *esp_ota_get_running_partition(void)
+{ return reverse_slots ? &new_slot : &old_slot; }
 const esp_partition_t *esp_ota_get_boot_partition(void) { return boot; }
 const esp_partition_t *esp_ota_get_next_update_partition(const esp_partition_t *partition)
 { assert(partition == NULL); return selected_slot; }
@@ -123,7 +132,7 @@ const esp_partition_t *esp_partition_find_first(int type, int subtype, const cha
     assert(type == ESP_PARTITION_TYPE_APP && label == NULL);
     if (missing_image_partition) return NULL;
     if (subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0) return &old_slot;
-    if (subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1) return selected_slot;
+    if (subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1) return reverse_slots ? &new_slot : selected_slot;
     assert(false);
     return NULL;
 }
@@ -136,6 +145,8 @@ esp_err_t esp_image_verify(esp_image_load_mode_t mode,
            (part->offset == new_slot.address && part->size == new_slot.size));
     ++image_verify_calls;
     advance_time(verify_advance_us);
+    if (part->offset == (reverse_slots ? old_slot.address : new_slot.address) &&
+        !target_image_valid) return ESP_FAIL;
     if (image_verify_result != ESP_OK) return image_verify_result;
     metadata->image_len = verified_image_size_bytes;
     return ESP_OK;
@@ -147,7 +158,10 @@ esp_err_t esp_ota_get_state_partition(const esp_partition_t *partition, esp_ota_
         advance_time(preflight_advance_us);
         preflight_advance_us = 0;
     }
-    if (partition == &old_slot) { *state = valid_old ? old_state : ESP_OTA_IMG_PENDING_VERIFY; return ESP_OK; }
+    if (partition == (reverse_slots ? &new_slot : &old_slot)) {
+        *state = valid_old ? old_state : ESP_OTA_IMG_PENDING_VERIFY;
+        return ESP_OK;
+    }
     *state = target_state;
     return target_lookup;
 }
@@ -222,13 +236,28 @@ esp_err_t esp_partition_read(const esp_partition_t *partition, size_t offset, vo
     ++partition_reads;
     advance_time(flash_read_advance_us);
     if (fail_read) return ESP_FAIL;
-    if (partition == &old_slot) {
+    if (partition == (reverse_slots ? &new_slot : &old_slot)) {
         assert(offset + size <= sizeof image_bytes);
         memcpy(data, image_bytes + offset, size);
     } else {
-        assert(offset + size <= staged_size);
-        memcpy(data, staged_bytes + offset, size);
+        if (offset == 0 && size == 1 && staged_size == 0) {
+            *(uint8_t *)data = 0xff;
+        } else {
+            assert(offset + size <= staged_size);
+            memcpy(data, staged_bytes + offset, size);
+        }
     }
+    return ESP_OK;
+}
+esp_err_t esp_partition_erase_range(const esp_partition_t *partition, size_t offset, size_t size)
+{
+    assert(partition == (reverse_slots ? &old_slot : &new_slot) &&
+           offset == 0 && size == partition->erase_size);
+    ++erase_calls;
+    last_erased = partition;
+    if (fail_erase) return ESP_FAIL;
+    target_image_valid = false;
+    staged_size = 0;
     return ESP_OK;
 }
 esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *config)
@@ -331,10 +360,119 @@ static eota_result_t run_update(const eota_image_t *request)
     return result == EOTA_UPDATE_OK ? eota_select(&policy, &prepared) : result;
 }
 
+static void signed_inactive(void)
+{
+    target_lookup = ESP_OK;
+    target_state = ESP_OTA_IMG_VALID;
+    staged_size = IMAGE_BYTES;
+    memcpy(staged_bytes, image_bytes, IMAGE_BYTES);
+}
+
+static void test_retire_inactive(void)
+{
+    uint8_t source_sha256[EOTA_SHA256_BYTES];
+    uint32_t source_size = 0;
+    reset();
+    assert(eota_sha256_verified_image(&policy, ESP_PARTITION_SUBTYPE_APP_OTA_0,
+                                      &source_size, source_sha256) == EOTA_UPDATE_OK);
+    assert(source_size == IMAGE_BYTES);
+    signed_inactive();
+    assert(eota_retire_inactive(&policy, ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                source_sha256) == EOTA_UPDATE_OK);
+    assert(erase_calls == 1 && invalidate_calls == 1 &&
+           target_lookup == ESP_ERR_NOT_FOUND && boot == &old_slot);
+    assert(eota_retire_inactive(&policy, ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                source_sha256) == EOTA_UPDATE_OK);
+    assert(erase_calls == 1 && invalidate_calls == 2);
+
+    reset(); signed_inactive();
+    fail_erase = true;
+    assert(eota_retire_inactive(&policy, ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                source_sha256) == EOTA_UPDATE_BOOT_STATE_UNKNOWN);
+    assert(erase_calls == 1 && invalidate_calls == 0 && target_image_valid);
+    fail_erase = false;
+    assert(eota_retire_inactive(&policy, ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                source_sha256) == EOTA_UPDATE_OK);
+
+    reset(); signed_inactive();
+    fail_invalidate = true;
+    assert(eota_retire_inactive(&policy, ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                source_sha256) == EOTA_UPDATE_BOOT_STATE_UNKNOWN);
+    assert(erase_calls == 1 && !target_image_valid && target_state == ESP_OTA_IMG_VALID);
+    fail_invalidate = false;
+    assert(eota_retire_inactive(&policy, ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                source_sha256) == EOTA_UPDATE_OK);
+    assert(erase_calls == 1 && target_lookup == ESP_ERR_NOT_FOUND);
+
+    reset();
+    target_image_valid = false;
+    fail_invalidate = true; /* No inactive otadata entry is also safe. */
+    assert(eota_retire_inactive(&policy, ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                source_sha256) == EOTA_UPDATE_OK);
+    assert(erase_calls == 0 && boot == &old_slot);
+
+    reset(); signed_inactive();
+    target_image_valid = false; /* App-side signature rejection is insufficient. */
+    assert(eota_retire_inactive(&policy, ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                source_sha256) == EOTA_UPDATE_OK);
+    assert(erase_calls == 1 && !target_image_valid);
+
+    reset(); signed_inactive();
+    uint8_t wrong_sha256[EOTA_SHA256_BYTES];
+    memcpy(wrong_sha256, source_sha256, sizeof wrong_sha256);
+    wrong_sha256[0] ^= 1U;
+    assert(eota_retire_inactive(&policy, ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                wrong_sha256) == EOTA_UPDATE_IMAGE_INVALID);
+    assert(eota_retire_inactive(&policy, ESP_PARTITION_SUBTYPE_APP_OTA_0,
+                                source_sha256) == EOTA_UPDATE_SLOT_UNAVAILABLE);
+    assert(eota_retire_inactive(&policy, ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                NULL) == EOTA_UPDATE_INVALID_REQUEST);
+    assert(erase_calls == 0);
+    boot = &new_slot;
+    assert(eota_retire_inactive(&policy, ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                source_sha256) == EOTA_UPDATE_SLOT_UNAVAILABLE);
+    boot = &old_slot;
+    old_state = ESP_OTA_IMG_PENDING_VERIFY;
+    assert(eota_retire_inactive(&policy, ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                source_sha256) == EOTA_UPDATE_SLOT_UNAVAILABLE);
+    old_state = ESP_OTA_IMG_VALID;
+    target_state = ESP_OTA_IMG_NEW;
+    assert(eota_retire_inactive(&policy, ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                source_sha256) == EOTA_UPDATE_OK);
+    assert(erase_calls == 1 && target_lookup == ESP_ERR_NOT_FOUND);
+
+    reset(); signed_inactive();
+    target_state = ESP_OTA_IMG_PENDING_VERIFY;
+    assert(eota_retire_inactive(&policy, ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                source_sha256) == EOTA_UPDATE_OK);
+    assert(erase_calls == 1 && target_lookup == ESP_ERR_NOT_FOUND);
+
+    reset();
+    reverse_slots = true;
+    boot = &new_slot;
+    selected_slot = &old_slot;
+    signed_inactive();
+    uint8_t reverse_source_sha256[EOTA_SHA256_BYTES];
+    assert(eota_sha256_verified_image(&policy, ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                      &source_size, reverse_source_sha256) == EOTA_UPDATE_OK);
+    assert(eota_retire_inactive(&policy, ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                reverse_source_sha256) == EOTA_UPDATE_SLOT_UNAVAILABLE);
+    assert(erase_calls == 0);
+    assert(eota_retire_inactive(&policy, ESP_PARTITION_SUBTYPE_APP_OTA_0,
+                                reverse_source_sha256) == EOTA_UPDATE_OK);
+    assert(erase_calls == 1 && last_erased == &old_slot && boot == &new_slot);
+    uint8_t reverse_after_sha256[EOTA_SHA256_BYTES];
+    assert(eota_sha256_verified_image(&policy, ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                      &source_size, reverse_after_sha256) == EOTA_UPDATE_OK &&
+           memcmp(reverse_source_sha256, reverse_after_sha256,
+                  sizeof reverse_source_sha256) == 0);
+}
+
 int main(void)
 {
     eota_image_t request = {.image_url = "https://example.test/esp-base.bin", .image_size_bytes = IMAGE_BYTES};
     assert(eota_available());
+    test_retire_inactive();
     reset(); digest(&request);
     eota_slots_t slots;
     assert(eota_preflight(&policy, IMAGE_BYTES, &slots) == EOTA_UPDATE_OK);

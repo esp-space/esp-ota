@@ -27,7 +27,7 @@ flowchart LR
     sample --> api
 ```
 
-准备阶段用 IDF 写 inactive 应用槽并验证完整 signed bin，**不切启动槽**；`esp_ota_begin` 可能清除该槽原有的 otadata 记录。应用可在两阶段之间持久提交与业务包的绑定；`eota_select` 再核对实际槽、摘要、当前可信产品约束与 IDF 签名，并显式切槽。切槽失败时库恢复旧运行槽的 VALID 状态并清除未启动候选的 NEW 状态，读回不确定则明确报错。库不创建 worker、不写业务 NVS、不管理 Wasm 包，也不替应用决定何时确认新固件。具体调用合同见 [API 说明](docs/design/api-contract.md)。
+准备阶段用 IDF 写 inactive 应用槽并验证完整 signed bin，**不切启动槽**；`esp_ota_begin` 可能清除该槽原有的 otadata 记录。与 Container 联合升级时，调用方先持久登记并读回 OTA 收据，再用 `eota_retire_inactive` 在写新固件前精确退役旧备用镜像，经签名/otadata 读回证明后才退役旧 Container 绑定；中途断电由调用方按原收据重入对账。应用可在两阶段之间持久提交与业务包的绑定；`eota_select` 再核对实际槽、摘要、当前可信产品约束与 IDF 签名，并显式切槽。切槽失败时库恢复旧运行槽的 VALID 状态并清除未启动候选的 NEW 状态，读回不确定则明确报错。库不创建 worker、不写业务 NVS、不管理 Wasm 包，也不替应用决定何时确认新固件。具体调用合同见 [API 说明](docs/design/api-contract.md)。
 
 ## 独立构建
 

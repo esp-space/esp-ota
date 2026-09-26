@@ -300,6 +300,110 @@ eota_result_t eota_observe_slots(const eota_policy_t *policy, eota_slots_t *slot
 #endif
 }
 
+eota_result_t eota_retire_inactive(const eota_policy_t *policy,
+                                   uint8_t expected_target_subtype,
+                                   const uint8_t expected_running_sha256[EOTA_SHA256_BYTES])
+{
+#if !EOTA_SIGNED_ENABLED
+    (void)policy; (void)expected_target_subtype; (void)expected_running_sha256;
+    return EOTA_UPDATE_UNSUPPORTED;
+#else
+    if (!valid_policy(policy) || expected_running_sha256 == NULL ||
+        (expected_target_subtype != ESP_PARTITION_SUBTYPE_APP_OTA_0 &&
+         expected_target_subtype != ESP_PARTITION_SUBTYPE_APP_OTA_1)) {
+        return EOTA_UPDATE_INVALID_REQUEST;
+    }
+    uint8_t any = 0;
+    for (size_t index = 0; index < EOTA_SHA256_BYTES; ++index) {
+        any |= expected_running_sha256[index];
+    }
+    if (any == 0) return EOTA_UPDATE_INVALID_REQUEST;
+
+    eota_slots_t before = {0};
+    const esp_partition_t *running = NULL;
+    const esp_partition_t *target = NULL;
+    if (observe_slots(policy, &before, &running, &target) != EOTA_UPDATE_OK ||
+        before.running_subtype != before.boot_subtype ||
+        before.target_subtype != expected_target_subtype ||
+        before.running_state != EOTA_STATE_VALID ||
+        (before.target_state != EOTA_STATE_UNTRACKED &&
+         before.target_state != EOTA_STATE_UNDEFINED &&
+         before.target_state != EOTA_STATE_VALID &&
+         before.target_state != EOTA_STATE_NEW &&
+         before.target_state != EOTA_STATE_PENDING_VERIFY &&
+         before.target_state != EOTA_STATE_INVALID &&
+         before.target_state != EOTA_STATE_ABORTED) ||
+        target->erase_size == 0 || target->erase_size > target->size) {
+        return EOTA_UPDATE_SLOT_UNAVAILABLE;
+    }
+
+    uint8_t prefix[EOTA_PREFIX_BYTES];
+    uint8_t running_sha256[EOTA_SHA256_BYTES];
+    uint32_t running_size = 0;
+    if (esp_partition_read(running, 0, prefix, sizeof prefix) != ESP_OK) {
+        return EOTA_UPDATE_RESOURCE_FAILURE;
+    }
+    if (!matches_image_target(policy, prefix)) return EOTA_UPDATE_WRONG_TARGET;
+    if (eota_sha256_verified_image(policy, before.running_subtype,
+                                   &running_size, running_sha256) != EOTA_UPDATE_OK ||
+        running_size == 0 ||
+        memcmp(running_sha256, expected_running_sha256, EOTA_SHA256_BYTES) != 0) {
+        return EOTA_UPDATE_IMAGE_INVALID;
+    }
+    const uint32_t expected_running_size = running_size;
+
+    uint8_t target_magic = 0;
+    if (esp_partition_read(target, 0, &target_magic, sizeof target_magic) != ESP_OK) {
+        return EOTA_UPDATE_BOOT_STATE_UNKNOWN;
+    }
+    /* The caller's durable prewrite receipt authorizes retiring this exact
+     * inactive slot. App-side signature rejection alone does not prove the
+     * bootloader will refuse the image under every signed-app configuration.
+     * Only an erased first image sector (0xff magic) avoids a repeat erase
+     * after reset. Invalidate otadata separately and inspect both facts. */
+    if (target_magic != 0xffU &&
+        esp_partition_erase_range(target, 0, target->erase_size) != ESP_OK) {
+        return EOTA_UPDATE_BOOT_STATE_UNKNOWN;
+    }
+    (void)esp_ota_invalidate_inactive_ota_data_slot();
+
+    if (esp_partition_read(target, 0, &target_magic, sizeof target_magic) != ESP_OK ||
+        target_magic != 0xffU) return EOTA_UPDATE_BOOT_STATE_UNKNOWN;
+
+    eota_slots_t after = {0};
+    if (observe_slots(policy, &after, NULL, NULL) != EOTA_UPDATE_OK ||
+        after.running_subtype != before.running_subtype ||
+        after.boot_subtype != before.boot_subtype ||
+        after.target_subtype != before.target_subtype ||
+        after.running_address_bytes != before.running_address_bytes ||
+        after.boot_address_bytes != before.boot_address_bytes ||
+        after.target_address_bytes != before.target_address_bytes ||
+        after.running_size_bytes != before.running_size_bytes ||
+        after.boot_size_bytes != before.boot_size_bytes ||
+        after.target_size_bytes != before.target_size_bytes ||
+        after.running_state != EOTA_STATE_VALID ||
+        (after.target_state != EOTA_STATE_UNTRACKED &&
+         after.target_state != EOTA_STATE_INVALID &&
+         after.target_state != EOTA_STATE_ABORTED)) {
+        return EOTA_UPDATE_BOOT_STATE_UNKNOWN;
+    }
+    uint32_t target_size = 0;
+    uint8_t target_sha256[EOTA_SHA256_BYTES];
+    if (eota_sha256_verified_image(policy, expected_target_subtype,
+                                   &target_size, target_sha256) !=
+        EOTA_UPDATE_IMAGE_INVALID) {
+        return EOTA_UPDATE_BOOT_STATE_UNKNOWN;
+    }
+    if (eota_sha256_verified_image(policy, before.running_subtype,
+                                   &running_size, running_sha256) != EOTA_UPDATE_OK ||
+        running_size != expected_running_size ||
+        memcmp(running_sha256, expected_running_sha256, EOTA_SHA256_BYTES) != 0) {
+        return EOTA_UPDATE_BOOT_STATE_UNKNOWN;
+    }
+    return EOTA_UPDATE_OK;
+#endif
+}
+
 eota_result_t eota_prepare(const eota_policy_t *policy, const eota_image_t *image,
                            eota_progress_t progress, void *context, eota_prepared_t *prepared)
 {

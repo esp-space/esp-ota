@@ -98,6 +98,20 @@ eota_result_t eota_observe_slots(const eota_policy_t *policy, eota_slots_t *slot
  * operation receipt. prepare repeats the check before the first Flash write. */
 eota_result_t eota_preflight(const eota_policy_t *policy, uint32_t image_size_bytes,
                              eota_slots_t *slots);
+/* Destructively retire the inactive app after the caller has durably recorded
+ * the authorized operation and serialized all app/otadata writers. The exact
+ * signed running image must match expected_running_sha256, be selected and
+ * VALID; expected_target_subtype prevents erasing a different OTA slot.
+ * Ensures the target's first sector is erased and reads back its image magic;
+ * attempts to invalidate its inactive otadata entry, then requires readback
+ * to prove the target image is invalid and the running image/selector remain
+ * unchanged. A partial write or failed
+ * readback returns BOOT_STATE_UNKNOWN; the durable caller receipt must be
+ * reconciled before another operation. This call is idempotent under that
+ * receipt, but it never creates or updates the receipt itself. */
+eota_result_t eota_retire_inactive(const eota_policy_t *policy,
+                                   uint8_t expected_target_subtype,
+                                   const uint8_t expected_running_sha256[EOTA_SHA256_BYTES]);
 /* Synchronously downloads into the inactive slot and verifies its complete
  * signed bytes. It does not select a new boot slot or reboot. ESP-IDF may
  * invalidate the inactive slot's previous otadata entry at esp_ota_begin.
